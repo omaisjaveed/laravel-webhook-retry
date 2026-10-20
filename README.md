@@ -1,26 +1,42 @@
 # Laravel Webhook Delivery & Retry
 
-A complete Laravel 11 application for reliable HTTP webhook delivery with database-backed queues, automatic retries, delivery/attempt logging, and a protected dashboard.
+Reliable outbound webhook delivery for Laravel — database queues, automatic retries, attempt logging, idempotency via event IDs, and a protected monitoring dashboard.
 
-> **Isolation note:** This project lives only in `Laravel-Webhook-Retry-Package`. It does **not** change other Laravel 8 (or any other) apps on your machine. Each app keeps its own `vendor/` and `composer.json`.
+Built with **Laravel 11** and **PHP 8.2**. Redis is **not** required.
+
+---
+
+## Features
+
+- Send JSON events to any HTTP endpoint (warehouse APIs, third-party services, etc.)
+- Configurable destination URL, auth headers, event subscriptions, timeout, max attempts, and retry intervals
+- Laravel **database** queue driver (no Redis)
+- Automatic retries on HTTP / connection failures
+- Persists delivery status, event IDs, HTTP responses, errors, and per-attempt logs
+- Duplicate dispatch protection with unique `(endpoint, event_id)`
+- Manual retry for failed / permanently failed deliveries
+- Simple protected Blade dashboard (stats, history, attempt details)
+- Feature tests for success, failure, retries, max attempts, and manual retry
+
+---
 
 ## Requirements
 
 - PHP 8.2+
 - Composer
-- MySQL (this project is configured for database `webbook` by default)
-- No Redis required (`QUEUE_CONNECTION=database`)
+- MySQL (or MariaDB)
+- No Redis
 
-## Setup
+---
+
+## Installation
 
 ```bash
-cd C:\xampp\htdocs\Laravel-Webhook-Retry-Package
+git clone https://github.com/YOUR_USERNAME/laravel-webhook-retry.git
+cd laravel-webhook-retry
 
-# Dependencies (already installed if you followed the agent setup)
 composer install
-
-# Environment
-copy .env.example .env
+cp .env.example .env          # Windows: copy .env.example .env
 php artisan key:generate
 ```
 
@@ -51,6 +67,8 @@ WEBHOOK_DASHBOARD_USER=admin
 WEBHOOK_DASHBOARD_PASSWORD=secret
 ```
 
+> On older MySQL / MariaDB (XAMPP), keep `DB_COLLATION=utf8mb4_unicode_ci`.
+
 ### Migrate & seed
 
 ```bash
@@ -58,35 +76,37 @@ php artisan migrate
 php artisan db:seed
 ```
 
-The seeder creates a demo endpoint pointing at `https://httpbin.org/post`.
+Seeder creates a demo endpoint: **Demo Warehouse API** → `https://httpbin.org/post`  
+Subscribed events: `order.created`, `inventory.updated`.
 
-### Run the queue worker (required for delivery)
+---
 
-```bash
-php artisan queue:work database --sleep=1 --tries=1
-```
+## Running the app
 
-Keep this process running while dispatching webhooks.
+Use **two terminals**:
 
-### Serve the app
-
-With XAMPP Apache:
-
-`http://localhost/Laravel-Webhook-Retry-Package/public/webhooks/dashboard/login`
-
-Or:
+**Terminal 1 — web server**
 
 ```bash
 php artisan serve
 ```
 
-Then open `http://127.0.0.1:8000/webhooks/dashboard/login`.
+Dashboard: [http://127.0.0.1:8000/webhooks/dashboard/login](http://127.0.0.1:8000/webhooks/dashboard/login)  
+Default login: `admin` / `secret` (change in `.env`).
 
-Dashboard defaults: **admin / secret** (change in `.env`).
+**Terminal 2 — queue worker (required for delivery)**
+
+```bash
+php artisan queue:work database --sleep=1 --tries=1
+```
+
+Without the worker, deliveries stay `pending`.
+
+---
 
 ## Usage
 
-### 1) Create an endpoint (code / tinker)
+### Create an endpoint
 
 ```php
 use App\Models\WebhookEndpoint;
@@ -97,7 +117,6 @@ WebhookEndpoint::create([
     'secret' => 'shared-hmac-secret',
     'auth_headers' => [
         'Authorization' => 'Bearer YOUR_TOKEN',
-        'X-Api-Key' => 'optional-key',
     ],
     'subscribed_events' => ['order.created', 'inventory.updated'], // null = all events
     'is_active' => true,
@@ -107,54 +126,84 @@ WebhookEndpoint::create([
 ]);
 ```
 
-### 2) Dispatch an event from your app
+### Dispatch an event (from code)
 
 ```php
 use App\Facades\Webhook;
 
-$deliveries = Webhook::dispatch('order.created', [
+Webhook::dispatch('order.created', [
     'order_id' => 1001,
     'sku' => 'WH-42',
     'qty' => 3,
-], eventId: 'order-1001-created'); // stable ID helps prevent duplicates
+], eventId: 'order-1001');
 ```
 
-Or via Artisan:
+Any event name and JSON payload work — not only orders.  
+Use a stable `eventId` so the same event is not queued twice for the same endpoint.
+
+### Dispatch via Artisan
+
+**PowerShell:**
+
+```powershell
+php artisan webhook:dispatch order.created '{\"order_id\":1001,\"sku\":\"WH-42\"}' --event-id=order-1001
+```
+
+**Bash:**
 
 ```bash
-php artisan webhook:dispatch order.created "{\"order_id\":1001,\"sku\":\"WH-42\"}" --event-id=order-1001-created
+php artisan webhook:dispatch order.created '{"order_id":1001,"sku":"WH-42"}' --event-id=order-1001
 ```
 
-### 3) What receivers get
+Examples of custom events:
 
-JSON POST body = your payload, plus headers:
+```powershell
+php artisan webhook:dispatch inventory.updated '{\"sku\":\"WH-42\",\"qty\":20}' --event-id=inv-42-1
+php artisan webhook:dispatch shipment.dispatched '{\"tracking\":\"PK123\"}' --event-id=ship-123
+```
+
+> Endpoint must subscribe to that event name (or have `subscribed_events = null`).
+
+---
+
+## What receivers get
 
 | Header | Purpose |
 |--------|---------|
-| `X-Webhook-Event-Id` | Stable event ID (use for idempotency) |
+| `X-Webhook-Event-Id` | Stable event ID — use for idempotency |
 | `X-Webhook-Event` | Event name |
-| `X-Webhook-Signature` | HMAC-SHA256 of raw JSON body (when endpoint `secret` is set) |
-| Custom `auth_headers` | Whatever you configured |
+| `X-Webhook-Signature` | HMAC-SHA256 of JSON body (when endpoint `secret` is set) |
+| Custom headers | From `auth_headers` on the endpoint |
 
-**Important:** Receivers should treat deliveries as at-least-once and ignore duplicates using `X-Webhook-Event-Id`.
+Body: your JSON payload (`Content-Type: application/json`).
+
+**Receivers should treat delivery as at-least-once** and deduplicate using `X-Webhook-Event-Id`.
+
+---
 
 ## How retries work
 
 1. First attempt is queued immediately (`DeliverWebhookJob`).
-2. On HTTP failure / timeout / connection error, an attempt row is stored.
-3. If attempts remain, status becomes `failed` and another job is delayed using `retry_intervals`.
-4. When `max_attempts` is exhausted, status becomes `permanently_failed`.
-5. From the dashboard you can **Manual retry** a failed delivery (extends `max_attempts` and re-queues).
+2. On failure (non-2xx, timeout, connection error), an attempt row is stored.
+3. If attempts remain → status `failed`, next job delayed using `retry_intervals`.
+4. When `max_attempts` is exhausted → status `permanently_failed`.
+5. Dashboard **Manual retry** re-queues the delivery (extends `max_attempts`).
 
-Duplicate protection on the sender side: unique index on `(webhook_endpoint_id, event_id)`.
+Default intervals: `60s → 300s → 900s → 3600s` (configurable in `.env`).
+
+Sender-side duplicate guard: unique index on `(webhook_endpoint_id, event_id)`.
+
+---
 
 ## Dashboard
 
-- Login at `/webhooks/dashboard/login`
+- Login: `/webhooks/dashboard/login`
 - Delivery statistics
-- Filterable delivery history
+- Filterable history
 - Attempt details (HTTP status, response body, errors, duration)
-- Manual retry for failed / permanently failed deliveries
+- Manual retry for failed deliveries
+
+---
 
 ## Testing
 
@@ -162,37 +211,64 @@ Duplicate protection on the sender side: unique index on `(webhook_endpoint_id, 
 php artisan test
 ```
 
-Feature coverage includes:
+Covered scenarios:
 
-- successful delivery
-- failed delivery + delayed retry job
-- maximum attempts → permanently failed
-- manual retry
-- duplicate `event_id` ignored for the same endpoint
-- dashboard auth + retry action
+- Successful delivery
+- Failed delivery + delayed retry job
+- Maximum attempts → permanently failed
+- Manual retry
+- Duplicate `event_id` ignored for the same endpoint
+- Dashboard auth + retry action
 
-Tests use in-memory SQLite (`phpunit.xml`) and do not touch your `webbook` MySQL database.
+Tests use in-memory SQLite and do not touch your MySQL database.
 
-## Project layout (key files)
+---
+
+## Project structure
 
 ```
-app/Services/WebhookDispatcher.php      # queue deliveries
-app/Services/WebhookDeliveryService.php # HTTP send + attempt logs
-app/Jobs/DeliverWebhookJob.php          # retry orchestration
-app/Models/WebhookEndpoint.php
-app/Models/WebhookDelivery.php
-app/Models/WebhookAttempt.php
+app/
+  Console/Commands/DispatchWebhookCommand.php
+  Enums/WebhookDeliveryStatus.php
+  Facades/Webhook.php
+  Http/Controllers/WebhookDashboard/
+  Http/Middleware/WebhookDashboardAuth.php
+  Jobs/DeliverWebhookJob.php
+  Models/WebhookEndpoint.php
+  Models/WebhookDelivery.php
+  Models/WebhookAttempt.php
+  Services/WebhookDispatcher.php
+  Services/WebhookDeliveryService.php
 config/webhooks.php
+database/migrations/
+database/seeders/WebhookSeeder.php
 resources/views/webhooks/dashboard/
+tests/Feature/
 ```
 
-## Important decisions
+---
 
-- **Laravel 11** matches installed PHP 8.2; Laravel 8 is not a good fit for PHP 8.2.
-- **Database queue** so Redis is unnecessary.
-- **Application-level retry delays** (not only Laravel job `$tries`) so intervals are explicit and stored on the delivery.
-- **Idempotency** uses unique `(endpoint, event_id)` plus documented receiver-side deduplication.
+## Design notes
 
-## Composer SSL note (Windows / XAMPP)
+- **Database queue** — simpler local/prod setup without Redis
+- **App-level retry delays** — intervals are explicit and stored on each delivery
+- **Idempotency** — unique `(endpoint, event_id)` plus documented receiver-side dedupe
+- **Observability** — every HTTP attempt is logged for debugging and support
 
-If `composer install` fails with `curl error 60` against GitHub, your PHP cURL trust store may not match Windows. This repo may contain project-local `disable-tls` composer config used only for this folder during setup. Prefer fixing `openssl.cafile` / `curl.cainfo` in `php.ini` long-term. This does not affect other projects' Composer configs unless you change them globally yourself.
+---
+
+## Optional: HTTPS / SSL on Windows (XAMPP)
+
+If outbound HTTPS fails with `cURL error 60`, set a CA bundle in `.env`:
+
+```env
+HTTP_CA_BUNDLE=C:/xampp/php/extras/ssl/combined-ca.pem
+```
+
+(or your system `cacert.pem` path). Restart `queue:work` after changing this.
+
+---
+
+## License
+
+MIT
