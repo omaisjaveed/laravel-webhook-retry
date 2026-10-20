@@ -255,19 +255,7 @@ tests/Feature/
 - **Idempotency** — unique `(endpoint, event_id)` plus documented receiver-side dedupe
 - **Observability** — every HTTP attempt is logged for debugging and support
 
----
 
-## Optional: HTTPS / SSL on Windows (XAMPP)
-
-If outbound HTTPS fails with `cURL error 60`, set a CA bundle in `.env`:
-
-```env
-HTTP_CA_BUNDLE=C:/xampp/php/extras/ssl/combined-ca.pem
-```
-
-(or your system `cacert.pem` path). Restart `queue:work` after changing this.
-
----
 
 ## License
 
